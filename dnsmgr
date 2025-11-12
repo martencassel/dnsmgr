@@ -4,11 +4,16 @@ STATE_FILE="$HOME/.dnsmgr_state"
 HOSTS_FILE="/etc/hosts"
 BEGIN_MARKER="# BEGIN DNSMGR"
 END_MARKER="# END DNSMGR"
+COREDNS_BACKUP="$HOME/.dnsmgr_coredns_backup.yaml"
 
 # Colors for CLI output
 GREEN="\033[0;32m"
 YELLOW="\033[1;33m"
 RED="\033[0;31m"
+BLUE="\033[0;34m"
+MAGENTA="\033[0;35m"
+CYAN="\033[0;36m"
+DIM="\033[2m"
 RESET="\033[0m"
 
 # Ensure state file exists
@@ -25,13 +30,17 @@ print_help() {
   echo "  dnsmgr <command> [options]"
   echo
   echo -e "${GREEN}Commands:${RESET}"
-  printf "  %-20s %s\n" "alloc --pool <range> --ip <ip>" "Allocate next free domain from pool"
-  printf "  %-20s %s\n" "add <domain> --ip <ip>"          "Add a specific domain → IP mapping"
-  printf "  %-20s %s\n" "release <domain>"               "Release a domain allocation"
-  printf "  %-20s %s\n" "list"                           "List all managed domains"
-  printf "  %-20s %s\n" "render-env --prefix <PREFIX>"   "Export domains as environment variables"
-  printf "  %-20s %s\n" "sync"                           "Reconcile /etc/hosts with state file"
-  printf "  %-20s %s\n" "-h, --help"                     "Show this help screen"
+  printf "  %-24s %s\n" "alloc --pool <range> --ip <ip>" "Allocate next free domain from pool"
+  printf "  %-24s %s\n" "add <domain> --ip <ip>"          "Add a specific domain → IP mapping"
+  printf "  %-24s %s\n" "release <domain>"               "Release a domain allocation"
+  printf "  %-24s %s\n" "list"                           "List all managed domains"
+  printf "  %-24s %s\n" "render-env --prefix <PREFIX>"   "Export domains as environment variables"
+  printf "  %-24s %s\n" "sync"                           "Reconcile /etc/hosts with state file"
+  printf "  %-24s %s\n" "sync-coredns [--dry-run]"       "Reconcile CoreDNS ConfigMap with state file and restart CoreDNS"
+  printf "  %-24s %s\n" "health-coredns [--domain D]"    "Check CoreDNS pods and DNS resolution health"
+  printf "  %-24s %s\n" "print-coredns"                  "Print current CoreDNS Corefile with colors"
+  printf "  %-24s %s\n" "rollback-coredns"               "Restore last known good CoreDNS ConfigMap from backup"
+  printf "  %-24s %s\n" "-h, --help"                     "Show this help screen"
   echo
   echo -e "${GREEN}Examples:${RESET}"
   echo "  dnsmgr alloc --pool app1.local-app5.local --ip 127.0.0.1"
@@ -40,6 +49,8 @@ print_help() {
   echo "  dnsmgr list"
   echo "  eval \$(dnsmgr render-env --prefix MYAPP)"
   echo "  dnsmgr sync"
+  echo "  dnsmgr sync-coredns"
+  echo "  dnsmgr health-coredns --domain app1.local"
   echo
   echo -e "${GREEN}Notes:${RESET}"
   echo "  - State file: $STATE_FILE"
@@ -47,6 +58,188 @@ print_help() {
   echo "  - Managed block is fenced by '$BEGIN_MARKER' and '$END_MARKER'"
 }
 
+# --- Core helpers ---
+
+build_hosts_entries() {
+  # Build DNSMGR block content: "IP DOMAIN" per line, fenced by markers
+  local out
+  out="$BEGIN_MARKER"$'\n'
+  while read -r domain ip; do
+    [[ -n "$domain" && -n "$ip" ]] && out+="$ip $domain"$'\n'
+  done < "$STATE_FILE"
+  out+="$END_MARKER"
+  echo "$out"
+}
+
+ensure_hosts_plugin() {
+  # Ensure a hosts { } plugin exists; if missing, insert a new one (with fallthrough)
+  # and inject the DNSMGR entries inside it. If it exists, replace or append our block.
+  local corefile="$1"
+  local entries="$2"
+
+  if echo "$corefile" | grep -qE '^\s*hosts\s*\{'; then
+    # Hosts plugin exists. Remove old DNSMGR block (if any) inside hosts and append new block.
+    # Remove any previous DNSMGR section globally (safeguard).
+    corefile=$(echo "$corefile" | sed "/$BEGIN_MARKER/,/$END_MARKER/d")
+    # Insert entries right after "hosts {" (preserve indentation)
+    corefile=$(awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v entries="$entries" '
+      BEGIN{printed=0}
+      {
+        print_line=$0
+        print print_line
+        if ($0 ~ /hosts[[:space:]]*\{/ && printed==0) {
+          # Insert our managed entries with two spaces indentation for readability
+          n=split(entries, lines, "\n");
+          for (i=1;i<=n;i++) {
+            if (length(lines[i])>0) {
+              print "        " lines[i]
+            }
+          }
+          printed=1
+        }
+      }
+    ' <<< "$corefile")
+    # Ensure fallthrough exists inside hosts block
+    if ! echo "$corefile" | awk '/hosts[[:space:]]*\{/,/\}/' | grep -q 'fallthrough'; then
+      corefile=$(awk '
+        BEGIN{inhosts=0}
+        /hosts[[:space:]]*\{/ {inhosts=1; print; next}
+        inhosts && /\}/ {print "        fallthrough"; inhosts=0; print; next}
+        {print}
+      ' <<< "$corefile")
+    fi
+  else
+    # Hosts plugin missing: inject it before "prometheus" or "forward"
+    local injection_point
+    if echo "$corefile" | grep -q 'prometheus'; then
+      injection_point='prometheus'
+    else
+      injection_point='forward'
+    fi
+    # Compose a full hosts block
+    hosts_block="    hosts {\n"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && hosts_block+="        $line\n"
+    done <<< "$entries"
+    hosts_block+="        fallthrough\n"
+    hosts_block+="    }\n"
+    # Insert before the injection point within the server block
+    corefile=$(awk -v point="$injection_point" -v block="$hosts_block" '
+      {
+        print $0
+        if ($0 ~ point && inserted != 1) {
+          printf "%s", block
+          inserted=1
+        }
+      }
+      END {
+        if (inserted != 1) {
+          # As a fallback, append at the end of the server block
+          printf "%s", block
+        }
+      }
+    ' <<< "$corefile")
+  fi
+
+  echo "$corefile"
+}
+
+print_coredns_config() {
+  local config="$1"
+  echo -e "${YELLOW}Current CoreDNS Config:${RESET}"
+  echo "────────────────────────────"
+  echo "$config" | while IFS= read -r line; do
+    if [[ "$line" =~ hosts[[:space:]]*\{ ]]; then
+      echo -e "${GREEN}$line${RESET}"
+    elif [[ "$line" =~ $BEGIN_MARKER ]] || [[ "$line" =~ $END_MARKER ]]; then
+      echo -e "${CYAN}$line${RESET}"
+    elif [[ "$line" =~ ^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+ ]]; then
+      ip=$(echo "$line" | awk '{print $1}')
+      domain=$(echo "$line" | awk '{print $2}')
+      echo -e "  ${MAGENTA}$ip${RESET} → ${BLUE}$domain${RESET}"
+    else
+      echo "$line"
+    fi
+  done
+}
+
+wait_for_coredns_ready() {
+  # Wait until coredns pods are ready (with timeout)
+  local timeout="${1:-60}"
+  local start_ts=$(date +%s)
+  while true; do
+    local ready
+    ready=$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.ready}{" "}{end}{end}' 2>/dev/null)
+    if [[ -n "$ready" && "$ready" != *"false"* ]]; then
+      echo -e "${GREEN}✓ CoreDNS pods ready${RESET}"
+      return 0
+    fi
+    if (( $(date +%s) - start_ts > timeout )); then
+      echo -e "${RED}✗ Timeout waiting for CoreDNS readiness${RESET}"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+health_coredns() {
+  local domain_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain) domain_override="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  echo -e "${YELLOW}Checking CoreDNS health...${RESET}"
+
+  # Check pod status quick gate
+  pods=$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[*].status.containerStatuses[*].ready}' 2>/dev/null)
+  if [[ -z "$pods" ]] || echo "$pods" | grep -q "false"; then
+    echo -e "${RED}✗ CoreDNS pods not ready${RESET}"
+    return 1
+  fi
+
+  # Select domain from override or state file
+  test_domain="${domain_override:-$(awk 'NR==1{print $1}' "$STATE_FILE")}"
+  test_ip="${domain_override:+$(awk -v d="$domain_override" '$1==d{print $2}' "$STATE_FILE")}"
+  if [[ -z "$domain_override" ]]; then
+    test_ip=$(awk 'NR==1{print $2}' "$STATE_FILE")
+  fi
+
+  if [[ -z "$test_domain" || -z "$test_ip" ]]; then
+    echo -e "${YELLOW}⚠ No domain/ip available in state for testing${RESET}"
+    return 0
+  fi
+
+  # Confirm record exists in ConfigMap Corefile
+  corefile=$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}')
+  if ! echo "$corefile" | awk '/hosts[[:space:]]*\{/,/\}/' | grep -qE "^[[:space:]]*$test_ip[[:space:]]+$test_domain[[:space:]]*$"; then
+    echo -e "${RED}✗ Record not present in CoreDNS: $test_domain → $test_ip${RESET}"
+    return 1
+  else
+    echo -e "${GREEN}✓ Record present in CoreDNS: $test_domain → $test_ip${RESET}"
+  fi
+
+  # Run DNS query inside a temporary pod (busybox with nslookup)
+  # Ensure any previous pod is cleaned up
+  kubectl delete pod dnsmgr-test --ignore-not-found -n default >/dev/null 2>&1
+  kubectl run dnsmgr-test --image=busybox:1.28 --restart=Never -n default --command -- sleep 30 >/dev/null 2>&1
+  kubectl wait --for=condition=Ready pod/dnsmgr-test -n default --timeout=30s >/dev/null 2>&1
+
+  kubectl -n default exec dnsmgr-test -- nslookup "$test_domain" >/tmp/dnsmgr_check 2>&1 || true
+  kubectl delete pod dnsmgr-test -n default --now >/dev/null 2>&1
+
+  if grep -q "$test_ip" /tmp/dnsmgr_check; then
+    echo -e "${GREEN}✓ DNS resolution healthy: $test_domain → $test_ip${RESET}"
+    return 0
+  else
+    echo -e "${RED}✗ DNS resolution failed for $test_domain${RESET}"
+    return 1
+  fi
+}
+
+# --- Host file management ---
 
 update_hosts() {
   # Remove old block
@@ -126,11 +319,7 @@ render_env() {
 
 sync_hosts() {
   echo -e "${YELLOW}Syncing /etc/hosts with state file...${RESET}"
-
-  # Extract current managed block (without markers)
   current=$(sed -n "/$BEGIN_MARKER/,/$END_MARKER/p" "$HOSTS_FILE" | grep -v "$BEGIN_MARKER" | grep -v "$END_MARKER")
-
-  # Normalize whitespace and empty lines
   current=$(echo "$current" | sed '/^$/d' | sort)
   state=$(sed '/^$/d' "$STATE_FILE" | sort)
 
@@ -143,7 +332,83 @@ sync_hosts() {
   fi
 }
 
-# Command dispatcher
+# --- CoreDNS sync / rollback ---
+
+sync_coredns() {
+  local dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  echo -e "${YELLOW}Syncing CoreDNS with state file...${RESET}"
+
+  # Backup current ConfigMap
+  kubectl -n kube-system get configmap coredns -o yaml > "$COREDNS_BACKUP"
+  echo -e "${DIM}Backup saved to $COREDNS_BACKUP${RESET}"
+
+  # Extract Corefile
+  corefile=$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}')
+
+  # Build managed entries
+  entries="$(build_hosts_entries)"
+
+  # Ensure hosts plugin and inject entries
+  corefile=$(ensure_hosts_plugin "$corefile" "$entries")
+
+  # Show config
+  print_coredns_config "$corefile"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo -e "${YELLOW}Dry-run: not applying changes${RESET}"
+    return 0
+  fi
+
+  # Apply new ConfigMap
+  kubectl -n kube-system create configmap coredns --from-literal=Corefile="$corefile" -o yaml --dry-run=client | kubectl apply -f - || {
+    echo -e "${RED}✗ Failed to apply CoreDNS ConfigMap${RESET}"
+    return 1
+  }
+
+  # Restart and wait for readiness
+  kubectl -n kube-system rollout restart deployment coredns
+  wait_for_coredns_ready 90 || {
+    echo -e "${RED}✗ CoreDNS not ready after restart, rolling back${RESET}"
+    rollback_coredns
+    return 1
+  }
+
+  # Post-update health check (first domain)
+  if ! health_coredns; then
+    echo -e "${RED}✗ Health check failed, rolling back${RESET}"
+    rollback_coredns
+    return 1
+  fi
+
+  echo -e "${GREEN}✓ CoreDNS synchronized, restarted, and healthy${RESET}"
+}
+
+rollback_coredns() {
+  if [ ! -f "$COREDNS_BACKUP" ]; then
+    echo -e "${RED}No backup found${RESET}"
+    return 1
+  fi
+  kubectl apply -f "$COREDNS_BACKUP" || {
+    echo -e "${RED}✗ Failed to apply CoreDNS backup${RESET}"
+    return 1
+  }
+  kubectl -n kube-system rollout restart deployment coredns
+  wait_for_coredns_ready 90 || {
+    echo -e "${RED}✗ CoreDNS not ready after rollback${RESET}"
+    return 1
+  }
+  echo -e "${GREEN}✓ CoreDNS rolled back from backup${RESET}"
+}
+
+# --- Command dispatcher ---
+
 cmd="$1"
 shift || true
 
@@ -185,6 +450,19 @@ case "$cmd" in
     ;;
   sync)
     sync_hosts
+    ;;
+  sync-coredns)
+    sync_coredns "$@"
+    ;;
+  health-coredns)
+    health_coredns "$@"
+    ;;
+  print-coredns)
+    cfg=$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}')
+    print_coredns_config "$cfg"
+    ;;
+  rollback-coredns)
+    rollback_coredns
     ;;
   ""|-h|--help)
     print_help
